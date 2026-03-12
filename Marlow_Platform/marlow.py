@@ -97,7 +97,7 @@ except ImportError:
 
 # Use mode-specific DB if configured (school and rehab get separate vaults)
 _db_path = MODE_CONFIG.get("db_path", "vault.db")
-db = DatabaseManager(_db_path if _db_path != "vault.db" else None)
+db = DatabaseManager(_db_path) if _db_path != "vault.db" else DatabaseManager()
 
 # Strategy planner — graceful fallback if not yet installed
 try:
@@ -206,9 +206,6 @@ def _run_post_sync_crash_check():
 
 def run_startup_sequence():
     # ── Tiered memory consolidation ───────────────────────────────────────
-    # Runs silently. Compresses old data into tiers if any pass is due.
-    # Weekly: algorithmic, free. Monthly/annual: Groq calls, fires rarely.
-    # Output only shown if something actually ran.
     if _CONSOLIDATOR_AVAILABLE:
         try:
             consolidation_actions = maybe_consolidate_memory(db)
@@ -223,8 +220,21 @@ def run_startup_sequence():
         except Exception:
             pass
 
+    # ── Contradiction engine: assess pending intentions (0 Groq calls) ───
+    try:
+        from core.contradiction_engine import assess_pending_intentions
+        assess_pending_intentions(db)
+    except Exception:
+        pass
+
+    # ── Streak tracker: update today's execution status (0 Groq calls) ───
+    try:
+        from core.streak_tracker import assess_today
+        assess_today(db)
+    except Exception:
+        pass
+
     # SWAP 11: Reactive crash alert fires first.
-    # Predictive only fires if reactive did NOT trigger — both firing is redundant noise.
     alert = generate_crash_alert(db)
     if alert:
         print(alert)
@@ -249,6 +259,26 @@ def run_startup_sequence():
             print()
             divider("═")
             print()
+    except Exception:
+        pass
+
+    # ── Weekly pre-mortem (1 Groq call, fires Monday or if 10+ days) ────
+    try:
+        from core.weekly_premortem import should_run_premortem, generate_weekly_premortem
+        if should_run_premortem(db):
+            premortem = generate_weekly_premortem(db)
+            if premortem and not premortem.startswith("["):
+                print()
+                divider("·")
+                print("  ◆ ALDRIC — WEEKLY PRE-MORTEM")
+                divider("·")
+                print()
+                for line in premortem.split("\n"):
+                    if line.strip():
+                        print(f"  {line.strip()}")
+                print()
+                divider("·")
+                print()
     except Exception:
         pass
 
@@ -570,6 +600,13 @@ def run_vent_mode():
         return
 
     journal_id = db.save_journal(user_input, "vent")
+
+    # Extract stated intentions for contradiction engine (0 Groq calls)
+    try:
+        from core.contradiction_engine import save_intentions_from_entry
+        save_intentions_from_entry(db, user_input, source_type="vent")
+    except Exception:
+        pass
     print()
     print("  Classifying intent...")
     classification = classify_intent(user_input)
@@ -647,6 +684,14 @@ def run_journal_mode():
     print()
 
     journal_id     = db.save_journal(user_input, intent_type)
+
+    # Extract stated intentions for contradiction engine (0 Groq calls)
+    try:
+        from core.contradiction_engine import save_intentions_from_entry
+        save_intentions_from_entry(db, user_input, source_type="journal")
+    except Exception:
+        pass
+
     print("  Council is reading...")
     print()
 
@@ -777,6 +822,16 @@ def run_goals_mode():
     while True:
         section("GOALS")
 
+        # Streak display
+        try:
+            from core.streak_tracker import format_streak_display
+            streak_display = format_streak_display(db)
+            if streak_display:
+                print(streak_display)
+                print()
+        except Exception:
+            pass
+
         # Tier 1: Show goal momentum scores
         try:
             scorer    = GoalMomentumScorer(db)
@@ -900,12 +955,24 @@ def run_goals_mode():
 def run_weekly_report():
     section("WEEKLY REPORT")
     print()
+
+    # Show latest pre-mortem if available
+    try:
+        from core.weekly_premortem import get_latest_premortem
+        pm = get_latest_premortem(db)
+        if pm:
+            print(f"  Last pre-mortem: week of {pm['period_start'][:10]}")
+    except Exception:
+        pm = None
+
     latest = db.get_latest_weekly_report()
     if latest:
         print(f"  Last report generated: {latest['generated_at']}")
         print()
         print("  G  →  Generate new report for this week")
         print("  V  →  View last report")
+        if pm:
+            print("  P  →  View latest pre-mortem (ALDRIC week forecast)")
         print("  0  →  Back")
         print()
         choice = input("  Select: ").strip().upper()
@@ -919,6 +986,19 @@ def run_weekly_report():
                 print(f"  {line}")
             print()
             divider("═")
+            input("  Press ENTER to return...")
+            return
+        elif choice == "P" and pm:
+            print()
+            divider("·")
+            print(f"  ALDRIC — WEEK OF {pm['period_start'][:10]}")
+            divider("·")
+            print()
+            for line in pm["content"].split("\n"):
+                if line.strip():
+                    print(f"  {line.strip()}")
+            print()
+            divider("·")
             input("  Press ENTER to return...")
             return
         elif choice != "G":

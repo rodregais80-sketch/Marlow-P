@@ -159,13 +159,14 @@ Determine:
 3. lead: which persona leads
 
 Rules:
-- Pure emotion, no action request → SEREN active, others silent
-- Emotion + wants solution → SEREN + ALDRIC active, ORYN silent, MORRO off unless impulse detected
+- Pure emotion, no action request → SEREN active, ALDRIC silent, ORYN silent, MORRO off
+- Emotion + wants solution → SEREN active, ALDRIC active, ORYN silent, MORRO off
 - Strategy/business/money → ALDRIC active, MORRO active if risk present, SEREN silent, ORYN silent
-- Health/stats/data/biology → ORYN active, ALDRIC active, SEREN silent
+- Health/stats/data/biology → ORYN active, ALDRIC active, SEREN silent, MORRO off
 - Risky/impulsive → MORRO active, ALDRIC active, SEREN silent, ORYN silent
-- Crisis → SEREN active, ORYN active, ALDRIC silent, MORRO off
-- Mixed/general → all active
+- Crisis → SEREN active, ORYN active, ALDRIC silent, MORRO off (HARDCODED — no exceptions)
+- Vent (emotional release, no advice sought) → SEREN active, ALDRIC silent, ORYN silent, MORRO off
+- Mixed/general → all active except MORRO unless impulse language detected
 - MARLOW always synthesizes regardless
 
 Respond ONLY in valid JSON. No preamble:
@@ -669,22 +670,38 @@ def generate_session_brief(db: DatabaseManager) -> str:
     except Exception:
         momentum_ctx = ""
 
+    # Forward-looking context: streak and contradiction signals
+    forward_ctx = ""
+    try:
+        from core.streak_tracker import build_streak_context
+        forward_ctx += build_streak_context(db, max_chars=150)
+    except Exception:
+        pass
+    try:
+        from core.contradiction_engine import build_contradiction_context
+        forward_ctx += "\n" + build_contradiction_context(db, max_chars=200)
+    except Exception:
+        pass
+
     prompt = f"""You are MARLOW. Generate a pre-session intelligence brief for {name}.
 
 Last sync: {sync_type} logged {when} ({sync_time_str})
 
 Sync content:
-{content[:1200]}
+{content[:1000]}
 
 Goal momentum:
 {momentum_ctx[:300]}
 
-Write exactly 4 lines. No headers. No bullet points.
+{forward_ctx[:300]}
+
+Write exactly 5 lines. No headers. No bullet points.
 
 Line 1: State what was last logged and when. Include 1-2 key metric numbers.
-Line 2: Identify the single most important thing from this sync.
-Line 3: Note goal momentum — which goal is active, which is stalling.
+Line 2: Identify the single most important signal from this sync.
+Line 3: Note goal momentum — which goal is moving, which is stalling.
 Line 4: State the operator's own stated priority. If not logged, derive from context.
+Line 5: Forward projection — based on trajectory and patterns, what is this session most likely to surface? One sentence. Probabilistic, not motivational.
 
 Direct. Intelligence briefing tone. Every line carries weight."""
 
@@ -692,7 +709,7 @@ Direct. Intelligence briefing tone. Every line carries weight."""
         time.sleep(0.5)
         brief = groq_chat(
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.4, max_tokens=180, timeout=20
+            temperature=0.4, max_tokens=220, timeout=20
         )
         output = ["", "─"*60, f"  MARLOW BRIEF — {sync_time_str} ({when})", "─"*60]
         for line in brief.split("\n"):
@@ -1079,6 +1096,14 @@ def run_council(
     active_names = [k for k, v in routing.items() if v == "active"]
     silent_names = [k for k, v in routing.items() if v == "silent"]
 
+    # Hardcoded safety overrides — classifier cannot override these
+    if intent_type in ("vent", "crisis"):
+        routing["MORRO"] = "off"
+        if "MORRO" in active_names:
+            active_names.remove("MORRO")
+        if "MORRO" in silent_names:
+            silent_names.remove("MORRO")
+
     if intent_type == "crisis":
         db.save_crisis_flag(
             content=user_input,
@@ -1131,7 +1156,25 @@ def run_council(
         if plan_ctx:
             decision_ctx = (decision_ctx + "\n\n" + plan_ctx).strip()
     except Exception:
-        pass  # Non-critical — ALDRIC degrades gracefully without it
+        pass
+
+    # Contradiction map — personal commitment pattern fingerprint for ALDRIC
+    try:
+        from core.contradiction_engine import build_contradiction_context
+        contradiction_ctx = build_contradiction_context(db, max_chars=400)
+        if contradiction_ctx:
+            decision_ctx = (decision_ctx + "\n\n" + contradiction_ctx).strip()
+    except Exception:
+        pass
+
+    # Streak tracker — execution consistency for ALDRIC
+    try:
+        from core.streak_tracker import build_streak_context
+        streak_ctx = build_streak_context(db, max_chars=250)
+        if streak_ctx:
+            decision_ctx = (decision_ctx + "\n\n" + streak_ctx).strip()
+    except Exception:
+        pass
 
     degraded = {k: v for k, v in context_health.items() if v != "OK"}
     if degraded:
