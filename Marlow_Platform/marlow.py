@@ -1,20 +1,28 @@
 """
 marlow.py — Main entry point / CLI
 
-New in this version:
-- Startup: predictive crash warning fires (not just reactive alert)
-- Startup: auto weekly report displayed if 6+ days since last
-- Startup: pending decision reviews shown if any are due
-- Startup: memory consolidation pass fires silently if any tier is due
-- Main menu: option 10 — Decision Log (log + retrospective rate decisions)
-- Main menu: option 11 — Pinned Memory Manager (per-persona permanent memory)
-- Goals view: includes live momentum scores per goal
-- All v2 fixes preserved in full
+Fixes applied in this version:
+- SWAP 8:  Vent routing — intent forced to "vent", classifier routing preserved if SEREN active
+- SWAP 9:  Decision log prompt gated on decision-relevant language (prevents fatigue)
+- SWAP 10: Pending review count — direct DB query, no DecisionTracker instantiation per loop
+- SWAP 11: Predictive crash warning only fires if reactive alert did NOT already fire
+- SWAP 6:  build_synthesis() now passes PERSONAS so excluded_from_synthesis field is respected
+- Morning sync: intensity field added (was always NULL before)
+- All v3 features preserved in full
+
+Session 4 additions:
+- --mode flag: loads persona set and config from config/personas_<mode>.py
+  Defaults to personal. Options: personal | school | rehab
+- Strategy planner wired into Goals menu (option P per goal)
+- Structured logging: marlow_logger imported, error badge shown at startup
+- Meta-reasoning synthesis: council_engine.build_synthesis enriched with
+  behavioral feedback, plan status, and prior session outcome
 """
 
 import os
 import sys
 import uuid
+import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -36,7 +44,47 @@ from core.council_engine import (
     execute_task
 )
 from core.decision_tracker import DecisionTracker, GoalMomentumScorer
-from personas import PERSONAS
+from core.marlow_logger import log_info, log_warning, get_recent_error_count, get_log_path
+
+# ── Mode / branch loader ──────────────────────────────────────────────────────
+# --mode personal | school | rehab
+# Defaults to personal if not specified.
+# Each config file exports PERSONAS list and MODE_CONFIG dict.
+
+def _load_mode(mode_arg: str) -> tuple:
+    """
+    Load PERSONAS and MODE_CONFIG from config/personas_<mode>.py.
+    Falls back to root personas.py if config file not found.
+    Returns (PERSONAS, MODE_CONFIG).
+    """
+    mode = (mode_arg or "personal").lower().strip()
+    config_path = os.path.join(os.path.dirname(__file__), "config", f"personas_{mode}.py")
+
+    if os.path.exists(config_path):
+        import importlib.util
+        spec   = importlib.util.spec_from_file_location(f"personas_{mode}", config_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        personas    = getattr(module, "PERSONAS", [])
+        mode_config = getattr(module, "MODE_CONFIG", {"mode": mode})
+        log_info("ModeLoader", f"Loaded mode '{mode}' from config/personas_{mode}.py — {len(personas)} personas")
+        return personas, mode_config
+    else:
+        # Fall back to root personas.py
+        log_warning("ModeLoader", f"config/personas_{mode}.py not found — falling back to root personas.py")
+        from personas import PERSONAS as _P
+        return _P, {"mode": "personal", "display_name": "Personal Intelligence",
+                    "morro_enabled": True, "substance_tracking": True,
+                    "crisis_hardened": False, "db_path": "vault.db"}
+
+# Parse --mode before anything else
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--mode", default="personal", help="Run mode: personal | school | rehab")
+_args, _ = _parser.parse_known_args()
+
+PERSONAS, MODE_CONFIG = _load_mode(_args.mode)
+_ACTIVE_MODE = MODE_CONFIG.get("mode", "personal")
+_MODE_DISPLAY = MODE_CONFIG.get("display_name", "Personal Intelligence")
 
 # Tiered memory consolidator — graceful fallback if not yet installed
 try:
@@ -47,7 +95,31 @@ except ImportError:
     def maybe_consolidate_memory(db): return []
     def run_pin_menu(db): print("  Memory consolidator not installed.")
 
-db = DatabaseManager()
+# Use mode-specific DB if configured (school and rehab get separate vaults)
+_db_path = MODE_CONFIG.get("db_path", "vault.db")
+db = DatabaseManager(_db_path if _db_path != "vault.db" else None)
+
+# Strategy planner — graceful fallback if not yet installed
+try:
+    from core.strategy_planner import (
+        generate_plan_for_goal,
+        get_active_plan,
+        mark_step_complete,
+        mark_step_skipped,
+        build_plan_context,
+        get_stalled_steps,
+        _ensure_strategy_tables
+    )
+    _STRATEGY_PLANNER_AVAILABLE = True
+    _ensure_strategy_tables(db)
+except ImportError:
+    _STRATEGY_PLANNER_AVAILABLE = False
+    def generate_plan_for_goal(*a, **k): return {"error": "Strategy planner not installed"}
+    def get_active_plan(*a, **k): return None
+    def mark_step_complete(*a, **k): return False
+    def mark_step_skipped(*a, **k): return False
+    def build_plan_context(*a, **k): return ""
+    def get_stalled_steps(*a, **k): return []
 
 
 def clear():
@@ -120,14 +192,16 @@ def _safe_float(value: str, default=None):
 
 
 def _run_post_sync_crash_check():
-    alert      = generate_crash_alert(db)
-    predictive = generate_predictive_crash_warning(db)
+    # SWAP 11 logic applied here too: reactive first, predictive only if reactive silent
+    alert = generate_crash_alert(db)
     if alert:
         print()
         print(alert)
-    if predictive:
-        print()
-        print(predictive)
+    if not alert:
+        predictive = generate_predictive_crash_warning(db)
+        if predictive:
+            print()
+            print(predictive)
 
 
 def run_startup_sequence():
@@ -149,15 +223,16 @@ def run_startup_sequence():
         except Exception:
             pass
 
-    # Reactive crash alert
+    # SWAP 11: Reactive crash alert fires first.
+    # Predictive only fires if reactive did NOT trigger — both firing is redundant noise.
     alert = generate_crash_alert(db)
     if alert:
         print(alert)
 
-    # Tier 1: Predictive crash window
-    predictive = generate_predictive_crash_warning(db)
-    if predictive:
-        print(predictive)
+    if not alert:
+        predictive = generate_predictive_crash_warning(db)
+        if predictive:
+            print(predictive)
 
     # Tier 2: Auto weekly report
     try:
@@ -278,6 +353,7 @@ def run_morning_sync():
     data["fuel"]            = input("  What have you had to eat/drink so far: ").strip()
     data["mental_state"]    = input("  Mental/emotional state right now: ").strip()
     data["morning_routine"] = input("  Did you complete a morning routine (yes/no/partial): ").strip()
+    data["intensity"]       = input("  Work intensity so far (1-10, or skip): ").strip()  # FIX: was missing
     data["todays_focus"]    = input("  What is your #1 focus for today: ").strip()
     data["risk_ahead"]      = input("  Any risks or threats to today you can see already: ").strip()
     data["impulse_drive"]   = input("  Impulse drive — urge to chase something new (1-10): ").strip()
@@ -290,6 +366,7 @@ def run_morning_sync():
         "sleep_hours":   _safe_float(data["sleep_hours"]),
         "mental_fog":    _safe_int(data["mental_fog"]),
         "impulse_drive": _safe_int(data["impulse_drive"]),
+        "intensity":     _safe_int(data["intensity"]),  # FIX: now saved
     }
     db.save_metrics("morning", metrics)
     print()
@@ -411,8 +488,13 @@ def run_question_mode():
 
         conversation_history = db.get_conversation_as_messages(session_id, limit=10)
         council_output       = run_council(user_input, db, PERSONAS, classification, conversation_history)
-        synthesis            = build_synthesis(council_output, user_input, db,
-                                               silent_context=council_output.get("silent_context", ""))
+
+        # SWAP 6: pass PERSONAS so excluded_from_synthesis field is read properly
+        synthesis = build_synthesis(
+            council_output, user_input, db,
+            silent_context=council_output.get("silent_context", ""),
+            personas=PERSONAS
+        )
 
         full_response_text = ""
         for name, response in council_output["responses"]:
@@ -427,10 +509,23 @@ def run_question_mode():
 
         print_council_response(council_output, synthesis)
 
-        # Prompt to log this as a decision for retrospective tracking
-        print()
-        print("  [ Was a significant decision made in this exchange? ]")
-        log_decision = input("  Log it for retrospective rating in 30 days? (Y/N): ").strip().upper()
+        # SWAP 9: Decision log prompt only fires when decision-relevant language is detected.
+        # Prevents prompt fatigue from firing after every casual exchange.
+        _decision_signals = [
+            "should i", "decide", "decision", "choose", "going with", "going to",
+            "plan to", "commit", "invest", "quit", "leave", "start", "sign", "buy",
+            "sell", "hire", "fire", "move", "drop", "take the", "accept", "refuse"
+        ]
+        _input_lower  = user_input.lower()
+        _is_decision  = any(sig in _input_lower for sig in _decision_signals)
+
+        if _is_decision:
+            print()
+            print("  [ Decision language detected — log for retrospective rating? ]")
+            log_decision = input("  Log this decision? (Y/N): ").strip().upper()
+        else:
+            log_decision = "N"
+
         if log_decision == "Y":
             decision_text = input("  Describe the decision in one sentence: ").strip()
             if decision_text:
@@ -446,7 +541,7 @@ def run_question_mode():
                             "impulse": m["impulse_drive"],
                             "sleep":   m["sleep_hours"]
                         }
-                    tracker = DecisionTracker(db)
+                    tracker     = DecisionTracker(db)
                     decision_id = tracker.log_decision(decision_text, state)
                     print(f"  Decision logged (ID: {decision_id}). "
                           f"You'll be reminded to rate the outcome in 30 days.")
@@ -474,27 +569,36 @@ def run_vent_mode():
         print("  Nothing entered. Returning to menu.")
         return
 
-    journal_id     = db.save_journal(user_input, "vent")
+    journal_id = db.save_journal(user_input, "vent")
     print()
     print("  Classifying intent...")
     classification = classify_intent(user_input)
-    intent_type    = classification.get("intent_type", "vent")
 
-    if intent_type == "question":
-        classification["intent_type"] = "vent"
-        classification["routing"]     = {
-            "SEREN": "active", "ALDRIC": "active",
-            "ORYN":  "active", "MORRO":  "active"
+    # SWAP 8: Force intent_type to "vent" regardless of classifier output.
+    # Classifier may read factual language and return "question" — irrelevant in vent mode.
+    # If classifier routed SEREN correctly, keep that routing. Otherwise fall back to vent defaults.
+    classification["intent_type"] = "vent"
+    if classification.get("routing", {}).get("SEREN") not in ("active", "silent"):
+        classification["routing"] = {
+            "SEREN": "active", "ALDRIC": "silent",
+            "ORYN":  "silent", "MORRO":  "off"
         }
+        classification["lead"] = "SEREN"
+    intent_type = "vent"
 
-    print(f"  Intent: {classification.get('intent_type','vent').upper()}")
+    print(f"  Intent: VENT")
     print()
     print("  Council is reading...")
     print()
 
     council_output = run_council(user_input, db, PERSONAS, classification)
-    synthesis      = build_synthesis(council_output, user_input, db,
-                                     silent_context=council_output.get("silent_context", ""))
+
+    # SWAP 6: pass PERSONAS so excluded_from_synthesis field is read
+    synthesis = build_synthesis(
+        council_output, user_input, db,
+        silent_context=council_output.get("silent_context", ""),
+        personas=PERSONAS
+    )
 
     full_response_text = ""
     for name, response in council_output["responses"]:
@@ -503,7 +607,7 @@ def run_vent_mode():
         full_response_text += f"\nMARLOW SYNTHESIS:\n{synthesis}"
 
     db.update_journal_response(journal_id, full_response_text)
-    db.save_council_session(user_input, classification.get("intent_type","vent"), full_response_text)
+    db.save_council_session(user_input, intent_type, full_response_text)
     print_council_response(council_output, synthesis)
     input("  Press ENTER to return to menu...")
 
@@ -547,8 +651,13 @@ def run_journal_mode():
     print()
 
     council_output = run_council(user_input, db, PERSONAS, classification)
-    synthesis      = build_synthesis(council_output, user_input, db,
-                                     silent_context=council_output.get("silent_context", ""))
+
+    # SWAP 6: pass PERSONAS so excluded_from_synthesis field is read
+    synthesis = build_synthesis(
+        council_output, user_input, db,
+        silent_context=council_output.get("silent_context", ""),
+        personas=PERSONAS
+    )
 
     full_response_text = ""
     for name, response in council_output["responses"]:
@@ -600,14 +709,78 @@ def run_task_mode(prefill: str = None):
     input("  Press ENTER to return to menu...")
 
 
+def _display_goal_plan(goal_id: int) -> None:
+    """Show the active step plan for a goal, with step completion controls."""
+    plan = get_active_plan(db, goal_id)
+    if not plan:
+        print("\n  No execution plan exists for this goal.")
+        print("  Select P from the goal menu to generate one.\n")
+        input("  Press ENTER to return...")
+        return
+
+    print()
+    divider("─")
+    print(f"  EXECUTION PLAN  (generated {plan['created_at'][:10]})")
+    divider("─")
+    print()
+
+    status_symbols = {"pending": "○", "complete": "✓", "skipped": "–"}
+    for step in plan["steps"]:
+        sym   = status_symbols.get(step["status"], "○")
+        stall = "  ⚠ STALLED" if step["status"] == "pending" else ""
+        print(f"  [{sym}] Step {step['step_number']}: {step['title']}{stall}")
+        if step["description"]:
+            # Wrap description at 70 chars
+            desc = step["description"]
+            while desc:
+                print(f"       {desc[:70]}")
+                desc = desc[70:]
+        if step["notes"]:
+            print(f"       Note: {step['notes']}")
+        print()
+
+    divider("─")
+    print()
+    print("  C <step#>  →  Mark step complete")
+    print("  K <step#>  →  Mark step skipped")
+    print("  0          →  Back")
+    print()
+
+    while True:
+        cmd = input("  > ").strip().upper()
+        if cmd == "0":
+            break
+        parts = cmd.split()
+        if len(parts) == 2 and parts[0] in ("C", "K") and parts[1].isdigit():
+            target_num = int(parts[1])
+            matched    = [s for s in plan["steps"] if s["step_number"] == target_num]
+            if not matched:
+                print(f"  Step {target_num} not found.")
+                continue
+            step_id = matched[0]["id"]
+            notes   = input("  Notes (optional): ").strip()
+            if parts[0] == "C":
+                if mark_step_complete(db, step_id, notes):
+                    print(f"  Step {target_num} marked complete.")
+            else:
+                if mark_step_skipped(db, step_id, notes):
+                    print(f"  Step {target_num} marked skipped.")
+            # Reload and redisplay
+            print()
+            _display_goal_plan(goal_id)
+            return
+        else:
+            print("  Unrecognized command. Use: C 2  or  K 3  or  0")
+
+
 def run_goals_mode():
     while True:
         section("GOALS")
 
         # Tier 1: Show goal momentum scores
         try:
-            scorer  = GoalMomentumScorer(db)
-            scored  = scorer.score_all_goals(days=14)
+            scorer    = GoalMomentumScorer(db)
+            scored    = scorer.score_all_goals(days=14)
             score_map = {g["goal_id"]: g for g in scored}
         except Exception:
             score_map = {}
@@ -633,13 +806,29 @@ def run_goals_mode():
                     print(f"       Progress: {g['progress_note']}")
                 if g.get("target_date"):
                     print(f"       Target: {g['target_date']}")
+
+                # Show plan progress inline if a plan exists
+                if _STRATEGY_PLANNER_AVAILABLE:
+                    plan = get_active_plan(db, g["id"])
+                    if plan:
+                        total    = len(plan["steps"])
+                        complete = sum(1 for s in plan["steps"] if s["status"] == "complete")
+                        pct      = round((complete / total) * 100) if total else 0
+                        next_s   = next((s for s in plan["steps"] if s["status"] == "pending"), None)
+                        print(f"       Plan: {complete}/{total} steps ({pct}%)", end="")
+                        if next_s:
+                            print(f"  →  Next: {next_s['title'][:50]}", end="")
+                        print()
                 print()
 
         print()
-        print("  A  →  Add new goal")
-        print("  U  →  Update goal progress")
-        print("  S  →  Change goal status")
-        print("  0  →  Back")
+        print("  A        →  Add new goal")
+        print("  U        →  Update goal progress")
+        print("  S        →  Change goal status")
+        if _STRATEGY_PLANNER_AVAILABLE:
+            print("  P <id>   →  Generate ALDRIC execution plan for a goal")
+            print("  V <id>   →  View / update execution plan steps")
+        print("  0        →  Back")
         print()
         choice = input("  Select: ").strip().upper()
 
@@ -670,12 +859,42 @@ def run_goals_mode():
             if not goal_id.isdigit():
                 continue
             print("  1=active  2=completed  3=paused  4=dropped")
-            status_map = {"1":"active","2":"completed","3":"paused","4":"dropped"}
+            status_map = {"1": "active", "2": "completed", "3": "paused", "4": "dropped"}
             s = input("  Select: ").strip()
             if s in status_map:
                 db.update_goal_status(int(goal_id), status_map[s])
                 print(f"  Status updated to: {status_map[s]}")
             input("  Press ENTER to continue...")
+        elif _STRATEGY_PLANNER_AVAILABLE and choice.startswith("P"):
+            # P <id> — generate plan
+            parts = choice.split()
+            goal_id_str = parts[1] if len(parts) > 1 else input("  Goal # to plan: ").strip()
+            if not goal_id_str.isdigit():
+                continue
+            goal_id = int(goal_id_str)
+            goal_row = next((g for g in goals if g["id"] == goal_id), None)
+            if not goal_row:
+                print(f"  Goal #{goal_id} not found.")
+                input("  Press ENTER to continue...")
+                continue
+            print(f"\n  Asking ALDRIC to build a plan for: {goal_row['title']}")
+            print("  Generating...")
+            result = generate_plan_for_goal(goal_row, db)
+            if result.get("error"):
+                print(f"\n  Plan generation failed: {result['error']}")
+            else:
+                print(f"\n  Plan generated — {len(result['steps'])} steps")
+                if result.get("summary"):
+                    print(f"  ALDRIC: {result['summary']}")
+                print()
+                _display_goal_plan(goal_id)
+        elif _STRATEGY_PLANNER_AVAILABLE and choice.startswith("V"):
+            # V <id> — view/update steps
+            parts = choice.split()
+            goal_id_str = parts[1] if len(parts) > 1 else input("  Goal # to view: ").strip()
+            if not goal_id_str.isdigit():
+                continue
+            _display_goal_plan(int(goal_id_str))
 
 
 def run_weekly_report():
@@ -880,7 +1099,7 @@ def _run_static_profile_update():
     profile["biggest_challenge"]  = input(f"  Biggest Challenge [{existing.get('biggest_challenge','')}]: ").strip() or existing.get("biggest_challenge","")
     print("  Support style: 1=listener  2=directive  3=adaptive")
     style_choice = input(f"  Select [{existing.get('support_style','adaptive')}]: ").strip()
-    style_map = {"1":"listener","2":"directive","3":"adaptive"}
+    style_map = {"1": "listener", "2": "directive", "3": "adaptive"}
     profile["support_style"]      = style_map.get(style_choice, existing.get("support_style","adaptive"))
     profile["additional_context"] = input(f"  Additional context [{existing.get('additional_context','')}]: ").strip() or existing.get("additional_context","")
     db.save_static_profile(profile)
@@ -1019,16 +1238,29 @@ def main_menu():
     goal_count   = len(active_goals)
     now          = datetime.now().strftime("%A, %B %d — %I:%M %p")
 
-    # Pending decision reviews
+    # SWAP 10: Direct DB query — no DecisionTracker instantiation per menu loop.
+    # DecisionTracker instantiation every loop was a wasted object creation.
     try:
-        tracker         = DecisionTracker(db)
-        pending_reviews = len(tracker.get_pending_reviews())
+        pending_reviews = len(db.conn.execute(
+            "SELECT id FROM decision_log WHERE outcome_score IS NULL "
+            "AND review_due_at <= ? LIMIT 20",
+            (datetime.now().isoformat(),)
+        ).fetchall())
     except Exception:
         pending_reviews = 0
 
+    # Error badge — show if subsystem failures logged in last 24h
+    try:
+        err_count = get_recent_error_count(hours=24)
+    except Exception:
+        err_count = 0
+
     print()
     divider("═")
-    print(f"  MARLOW PLATFORM  |  {name}  |  {now}")
+    mode_tag = f"  [{_MODE_DISPLAY.upper()}]" if _ACTIVE_MODE != "personal" else ""
+    print(f"  MARLOW PLATFORM  |  {name}  |  {now}{mode_tag}")
+    if err_count:
+        print(f"  ⚠  {err_count} subsystem error(s) in last 24h  —  see {get_log_path()}")
     divider("═")
     print()
     print("  1  Daily Sync")

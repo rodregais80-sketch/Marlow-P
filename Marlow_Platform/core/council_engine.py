@@ -916,25 +916,6 @@ def _write_persona_memories(db: DatabaseManager, council_responses: list):
             pass
 
 
-# ── MORRO conditional ─────────────────────────────────────────────────────────
-
-def _should_run_morro(db: DatabaseManager, intent_type: str) -> bool:
-    if intent_type == "crisis":
-        return False
-    if intent_type == "vent":
-        return True
-    try:
-        latest  = db.get_recent_metrics(limit=1)
-        if not latest:
-            return True
-        impulse = _row_get(latest[0], "impulse_drive")
-        if impulse is None:
-            return True
-        return impulse >= 6
-    except Exception:
-        return True
-
-
 # ── Silent persona summaries for MARLOW ───────────────────────────────────────
 
 def _build_silent_persona_summaries(
@@ -1143,18 +1124,27 @@ def run_council(
         decision_ctx = ""
         context_health["Decision Tracker"] = f"DEGRADED — {str(e)[:60]}"
 
+    # Strategy plan context — appended to ALDRIC's decision_ctx
+    try:
+        from core.strategy_planner import build_plan_context
+        plan_ctx = build_plan_context(db, max_chars=400)
+        if plan_ctx:
+            decision_ctx = (decision_ctx + "\n\n" + plan_ctx).strip()
+    except Exception:
+        pass  # Non-critical — ALDRIC degrades gracefully without it
+
     degraded = {k: v for k, v in context_health.items() if v != "OK"}
     if degraded:
+        try:
+            from core.marlow_logger import log_context_health
+            log_context_health(context_health)
+        except Exception:
+            pass
         print("\n  ┌─ INTELLIGENCE LAYER WARNING ─────────────────────────┐")
         for layer, status in degraded.items():
             print(f"  │  ⚠  {layer}: {status}")
         print("  │  Council will respond with reduced context.")
         print("  └──────────────────────────────────────────────────────┘\n")
-
-    try:
-        decision_ctx = build_decision_context(db, max_chars=500)
-    except Exception:
-        decision_ctx = ""
 
     # ── Silent ORYN: fire biological read before main pool ────────────────
     # Conditions: vent or crisis mode AND ORYN is not already active (visible).
@@ -1206,7 +1196,7 @@ def run_council(
         tasks.append((persona, messages, is_lead, i * 0.4))
 
     results = {}
-    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
         future_map = {
             executor.submit(_call_persona, task[0], task[1], task[3]): task[0]["name"]
             for task in tasks
@@ -1225,11 +1215,20 @@ def run_council(
 
     _write_persona_memories(db, ordered_output)
 
-    # Tier 2: Extract behavioral tags from user input and save to log metadata
+    # SWAP 7: Extract behavioral tags and write to persona memory for pattern engine.
+    # Previously: tags were computed and silently discarded with `pass`.
+    # Now: tags are saved as MARLOW memory entries so PatternEngine can read them.
     try:
         tags = extract_behavioral_tags(user_input)
         if tags:
-            pass  # Tags available for future use in pattern engine
+            tag_summary = "Emotional tags: " + ", ".join(tags[:8])
+            db.save_persona_memory(
+                persona_name="MARLOW",
+                summary=tag_summary,
+                risk_score=3,
+                confidence_score=6,
+                decision="Auto-tagged"
+            )
     except Exception:
         pass
 
@@ -1270,11 +1269,17 @@ def _call_persona(persona: dict, messages: list, stagger_delay: float = 0.0) -> 
 call_persona = _call_persona
 
 
-def build_synthesis(council_output: dict, user_input: str, db: DatabaseManager, silent_context: str = "") -> str:
+def build_synthesis(council_output: dict, user_input: str, db: DatabaseManager, silent_context: str = "", personas: list = None) -> str:
+    # SWAP 6: Read excluded_from_synthesis from persona config if PERSONAS passed in.
+    if personas:
+        excluded = {p["name"] for p in personas if p.get("excluded_from_synthesis", False)}
+    else:
+        excluded = {"MORRO"}
+
     synthesis_responses = [
         (name, response)
         for name, response in council_output["responses"]
-        if name != "MORRO"
+        if name not in excluded
     ]
 
     persona_responses = "\n\n".join([
@@ -1283,6 +1288,47 @@ def build_synthesis(council_output: dict, user_input: str, db: DatabaseManager, 
 
     if not groq_available():
         return ""
+
+    # ── Meta-reasoning context block ─────────────────────────────────────────
+    # Give MARLOW richer feedback data so synthesis is grounded, not generic.
+    # Three sources: recent pattern signal, stalled plans, last synthesis outcome.
+
+    meta_block = ""
+    meta_parts = []
+
+    # 1. Recent behavioral signal — top pattern from PatternEngine if available
+    try:
+        engine      = PatternEngine(db)
+        insights    = engine.synthesize_master_insights()
+        top_signal  = insights.get("top_signal", "") or insights.get("primary_pattern", "")
+        if top_signal:
+            meta_parts.append(f"Current behavioral signal: {str(top_signal)[:200]}")
+    except Exception:
+        pass
+
+    # 2. Stalled execution steps — surfaces when operator is running a plan
+    try:
+        from core.strategy_planner import get_stalled_steps
+        stalled = get_stalled_steps(db, stall_days=7)
+        if stalled:
+            stall_names = list({s["goal_title"] for s in stalled})[:3]
+            meta_parts.append(f"Stalled execution: {', '.join(stall_names)}")
+    except Exception:
+        pass
+
+    # 3. Last synthesis outcome — what MARLOW said last session, very brief
+    try:
+        last_synth = db.conn.execute(
+            "SELECT content FROM logs WHERE sync_type = 'synthesis' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last_synth:
+            snippet = str(last_synth[0])[:150].replace("\n", " ")
+            meta_parts.append(f"Last synthesis: {snippet}...")
+    except Exception:
+        pass
+
+    if meta_parts:
+        meta_block = "\nMeta-context for this synthesis:\n" + "\n".join(f"- {p}" for p in meta_parts)
 
     synthesis_prompt = f"""You are MARLOW — the sovereign intelligence that oversees the council.
 
@@ -1297,10 +1343,12 @@ Council responses:
 {persona_responses}
 
 {silent_context}
+{meta_block}
 
 Synthesis rules:
 - 3 to 5 sentences maximum
 - Do not repeat what was already said — add the layer none of them said
+- If meta-context is present, use it to ground your synthesis in what is actually happening — not just what was asked
 - Identify the single most important thing the user should take away
 - Speak as a sovereign intelligence — direct, clear, no filler
 - If intent was vent, end with grounding. If question, end with clarity. If crisis, end with safety.
@@ -1308,10 +1356,20 @@ Synthesis rules:
 
     try:
         time.sleep(1.5)
-        return groq_chat(
+        result = groq_chat(
             messages=[{"role": "user", "content": synthesis_prompt}],
             temperature=0.6, max_tokens=300, timeout=25
         )
+        # Save synthesis to log for next session meta-reasoning
+        try:
+            db.conn.execute(
+                "INSERT INTO logs (sync_type, content) VALUES ('synthesis', ?)",
+                (result,)
+            )
+            db.conn.commit()
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return f"[Synthesis unavailable - {e}]"
 
